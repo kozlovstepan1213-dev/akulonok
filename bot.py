@@ -37,7 +37,7 @@ from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler, ContextTypes,
 )
 
-TELEGRAM_TOKEN = 9135746215:AAEL7EGJIY4FGIzE0BgCDMZjteizVm4Wb5Q
+TELEGRAM_TOKEN = "9135746215:AAEL7EGJIY4FGIzE0BgCDMZjteizVm4Wb5Q"
 FOOTBALL_API_KEY = os.environ["FOOTBALL_API_KEY"]
 TZ = ZoneInfo(os.environ.get("BOT_TZ", "Europe/Moscow"))
 SUBS_FILE = "subscribers.json"

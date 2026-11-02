@@ -1,0 +1,11 @@
+anyio==4.16.0
+APScheduler==3.11.3
+certifi==2026.10.23
+h11==0.16.0
+httpcore==1.0.9
+httpx==0.28.1
+idna==3.20
+python-telegram-bot==22.8
+typing_extensions==4.16.0
+tzdata==2026.6
+tzlocal==5.4.5

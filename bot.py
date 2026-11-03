@@ -76,6 +76,7 @@ LEAGUES = {
     "WTA": "🎾 Теннис WTA",
 }
 TENNIS = {"ATP": "atp", "WTA": "wta"}
+LEAGUE_PLAIN = {c: n.split(" ", 1)[1] for c, n in LEAGUES.items()}  # без эмодзи — для таблиц
 
 # Ключи спортов в The Odds API
 ODDS_SPORT = {
@@ -102,7 +103,7 @@ MAX_MODEL_GAP = 0.20        # модель расходится с рынком 
 MIN_SAMPLE_WARN = 30        # меньше стольки прогнозов — предупреждаем о малой выборке
 
 WEEKDAYS = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
-SEP = "\n\n──────────────\n\n"
+SEP = "\n\n━━━━━━━━━━━━━━━━━━━━\n\n"
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("sportbot")
@@ -259,10 +260,10 @@ async def get_form(code: str, n: int = 5) -> dict:
     return {tid: {k: v[-n:] for k, v in res.items()} for tid, res in teams.items()}
 
 
-def form_icons(results) -> str:
-    if not results:
-        return "н/д"
-    return "".join("🟢" if gf > ga else "🟡" if gf == ga else "🔴" for gf, ga in results)
+def form_icons(results, size: int = 5) -> str:
+    """Иконки формы фиксированной длины (недостающие матчи — ⚪), чтобы строки были ровными."""
+    icons = "".join("🟢" if gf > ga else "🟡" if gf == ga else "🔴" for gf, ga in results[-size:])
+    return icons + "⚪" * (size - len(results[-size:]))
 
 
 def form_points(results) -> str:
@@ -572,121 +573,156 @@ def tennis_odds(pack, p1: str, p2: str, when: str):
 # ======================================================================
 # Оформление прогнозов
 # ======================================================================
+# ---------- оформление: таблицы и рамка ----------
+TW = 30   # ширина моноширинных таблиц (символов)
+FW = 26   # внутренняя ширина рамки (+4 символа = 30, как у таблиц)
+HR = "─" * TW
+
+
+def fo(o) -> str:
+    """Кф для таблицы: 1.85 или тире."""
+    return f"{o[0]:.2f}" if o else "—"
+
+
+def frame(title: str, rows: list) -> str:
+    top, mid, bot = ("╔" + "═" * (FW + 2) + "╗", "╠" + "═" * (FW + 2) + "╣",
+                     "╚" + "═" * (FW + 2) + "╝")
+
+    def line(t):
+        return "║ " + t[:FW].ljust(FW) + " ║"
+    body = [top, line(title.center(FW)), mid] + [line(r) for r in rows] + [bot]
+    return "<pre>" + esc("\n".join(body)) + "</pre>"
+
+
+def pre(lines: list) -> str:
+    return "<pre>" + esc("\n".join(lines)) + "</pre>"
+
+
+def odds_note(title: str, prob: float, odd, mprob) -> str | None:
+    """Строка-пояснение под рамкой: откуда кф и как он соотносится с рынком."""
+    if not odd:
+        return None
+    parts = [odd[1]]
+    if mprob is not None:
+        parts.append(f"рынок {pct(mprob)}")
+    parts.append(f"справедл. кф {1 / prob:.2f}")
+    ev = prob * odd[0] - 1
+    if mprob is not None and abs(prob - mprob) > MAX_MODEL_GAP:
+        parts.append("⚠️ сильно расходится с рынком")
+    elif ev >= VALUE_EDGE:
+        parts.append(f"💎 value {ev:+.0%}")
+    return f"• {title}: " + " · ".join(parts)
+
+
+def notes_block(notes: list, odds) -> str:
+    notes = [n for n in notes if n]
+    out = []
+    if notes:
+        out.append("<i>" + "\n".join(esc(n) for n in notes) + "</i>")
+    if odds:
+        t = datetime.fromtimestamp(odds["fetched"], TZ).strftime("%H:%M")
+        out.append(f"<i>кф — лучшие из {odds['books']} БК на {t}, могут измениться</i>")
+    elif ODDS_ENABLED:
+        out.append("<i>кф по этому матчу не найдены</i>")
+    return "\n".join(out)
+
+
 def odd_of(odds, key):
     return odds["best"].get(key) if odds else None
 
 
-def pick_line(title: str, label: str, prob: float, odd=None, mprob=None) -> str:
-    s = f"▸ {title}: <b>{esc(label)}</b> — {pct(prob)}"
-    if odd:
-        s += f" · кф <b>{odd[0]:.2f}</b> ({esc(odd[1])})"
-        notes = []
-        if mprob is not None:
-            notes.append(f"рынок {pct(mprob)}")
-        notes.append(f"справедл. кф {1 / prob:.2f}")
-        ev = prob * odd[0] - 1
-        if mprob is not None and abs(prob - mprob) > MAX_MODEL_GAP:
-            notes.append("⚠️ сильно расходится с рынком — вероятна ошибка модели")
-        elif ev >= VALUE_EDGE:
-            notes.append(f"💎 value {ev:+.0%}")
-        s += "\n    <i>" + " · ".join(notes) + "</i>"
-    return s
-
-
-def odds_footnote(odds) -> str:
-    if odds:
-        t = datetime.fromtimestamp(odds["fetched"], TZ).strftime("%H:%M")
-        return f"<i>кф: лучшие из {odds['books']} БК на {t}, могут измениться</i>"
-    if ODDS_ENABLED:
-        return "<i>кф: по этому матчу данных нет</i>"
-    return ""
+def outcome_table(rows, odds) -> list:
+    """rows: [(метка, вероятность, ключ_кф)] -> строки таблицы с полосками (ширина всегда TW)."""
+    lines = [f"{'ИСХОД':<17}{'Мод.':>5}{'Кф':>8}" if odds else f"{'ИСХОД':<22}{'Модель':>8}"]
+    for lab, pr, k in rows:
+        left = f"{lab:<2} {bar(pr, 8)}"
+        lines.append(f"{left:<17}{pct(pr):>5}{fo(odd_of(odds, k)):>8}" if odds
+                     else f"{left:<22}{pct(pr):>8}")
+    return lines
 
 
 def football_card(m: dict, table: dict, form: dict, code: str, odds):
     """-> (текст HTML, список прогнозов для учёта в статистике)."""
     h, a = m["homeTeam"], m["awayTeam"]
     hn, an = h.get("shortName") or h["name"], a.get("shortName") or a["name"]
-    lines = [f"⚽ <b>{esc(hn)} — {esc(an)}</b>",
-             f"{esc(LEAGUES[code])} · 🕒 {local_time(m['utcDate'])}"]
+    out = [f"⚽ <b>{esc(hn)} — {esc(an)}</b>",
+           f"{esc(LEAGUES[code])} · 🕒 {local_time(m['utcDate'])}"]
 
     fh, fa = form.get(h["id"]), form.get(a["id"])
+    ht, at = table.get(h["id"]), table.get(a["id"])
+    tbl = []
     if fh and fa:
+        out += ["", "<b>Форма</b>",
+                f"{form_icons(fh['all'])}  {esc(hn)} · {form_points(fh['all'])}",
+                f"{form_icons(fa['all'])}  {esc(an)} · {form_points(fa['all'])}",
+                f"<i>дома / в гостях:</i> 🏠 {form_icons(fh['home'], 3)}  ✈️ {form_icons(fa['away'], 3)}"]
         hgf, hga = avg_goals(fh["all"])
         agf, aga = avg_goals(fa["all"])
-        lines += [
-            "", "<b>Форма</b> · последние матчи",
-            f"{esc(hn)}: {form_icons(fh['all'])} {form_points(fh['all'])}",
-            f"{esc(an)}: {form_icons(fa['all'])} {form_points(fa['all'])}",
-            f"Дома │ в гостях: {form_icons(fh['home'])} │ {form_icons(fa['away'])}",
-            f"Голы за/пропущ.: {hgf:.1f}/{hga:.1f} │ {agf:.1f}/{aga:.1f}",
-        ]
-    ht, at = table.get(h["id"]), table.get(a["id"])
-    if ht and at:
-        lines.append(f"Таблица: #{ht.get('position')} ({ht.get('points')} очк.) │ "
-                     f"#{at.get('position')} ({at.get('points')} очк.)")
+        tbl.append(f"{'':<10}{hn[:10]:>10}{an[:10]:>10}")
+        if ht and at:
+            tbl.append(f"{'Место':<10}{'#' + str(ht.get('position')):>10}{'#' + str(at.get('position')):>10}")
+            tbl.append(f"{'Очки':<10}{str(ht.get('points')):>10}{str(at.get('points')):>10}")
+        tbl.append(f"{'Голы з/п':<10}{f'{hgf:.1f}/{hga:.1f}':>10}{f'{agf:.1f}/{aga:.1f}':>10}")
 
     p = predict(ht or {"id": h["id"]}, at or {"id": a["id"]}, table, form, code,
                 stage=m.get("stage", ""))
     if not p:
-        return "\n".join(lines) + "\n\nℹ️ Недостаточно данных для прогноза.", []
+        out += ["", "ℹ️ Недостаточно данных для прогноза."]
+        return "\n".join(out), []
 
-    # --- блок вероятностей ---
-    rows = (("П1", p["home"], "home"), ("Х", p["draw"], "draw"), ("П2", p["away"], "away"))
-    pre = []
-    for lab, pr, k in rows:
-        o = odd_of(odds, k)
-        pre.append(f"{lab:<2} {bar(pr)} {pr * 100:>3.0f}%" + (f"  {o[0]:.2f}" if o else ""))
-    head = "<b>Исход</b> · модель" + (" │ лучший кф" if odds else "")
+    # ---- таблица модели (всё выровнено по сетке TW) ----
+    t = tbl + [HR] if tbl else []
+    t += outcome_table((("П1", p["home"], "home"), ("Х", p["draw"], "draw"),
+                        ("П2", p["away"], "away")), odds)
+    xg_txt = f"{p['xg'][0]:.1f}–{p['xg'][1]:.1f}"
+    t += [HR, f"{'ТОТАЛ 2.5':<14}{'ТБ':>8}{'ТМ':>8}",
+          f"{'Вероятность':<14}{pct(p['over25']):>8}{pct(1 - p['over25']):>8}"]
+    if odds and (odd_of(odds, "over") or odd_of(odds, "under")):
+        t.append(f"{'Кф':<14}{fo(odd_of(odds, 'over')):>8}{fo(odd_of(odds, 'under')):>8}")
+    t += [HR, f"{'ОБЕ ЗАБЬЮТ':<14}{'Да':>8}{'Нет':>8}",
+          f"{'Вероятность':<14}{pct(p['btts']):>8}{pct(1 - p['btts']):>8}",
+          HR, f"{'ДВОЙНОЙ ШАНС':<12}{'1X':>6}{'12':>6}{'X2':>6}",
+          f"{'Вероятность':<12}{pct(p['dc_1x']):>6}{pct(p['dc_12']):>6}{pct(p['dc_x2']):>6}",
+          HR, f"{'Счёт (xG)':<14}{str(p['score'][0]) + ':' + str(p['score'][1]):>6}"
+              f"{xg_txt:>10}"]
+    out += ["", pre(t),
+            f"🟨 <i>Карточки (оценка): ~{p['cards']:.1f} · ТБ 3.5 — {pct(p['cards_over35'])} · "
+            f"ТБ 4.5 — {pct(p['cards_over45'])}</i>"]
 
-    def with_odd(key):
-        o = odd_of(odds, key)
-        return f" (кф {o[0]:.2f})" if o else ""
-
-    lines += [
-        "", head, "<pre>" + "\n".join(pre) + "</pre>",
-        f"Двойной шанс: 1X {pct(p['dc_1x'])} · 12 {pct(p['dc_12'])} · X2 {pct(p['dc_x2'])}",
-        f"Тотал 2.5: ТБ {pct(p['over25'])}{with_odd('over')} · "
-        f"ТМ {pct(1 - p['over25'])}{with_odd('under')}",
-        f"Обе забьют: Да {pct(p['btts'])} · Нет {pct(1 - p['btts'])}",
-        f"Счёт: {p['score'][0]}:{p['score'][1]} · xG {p['xg'][0]:.1f}–{p['xg'][1]:.1f}",
-        f"Карточки (оценка): ~{p['cards']:.1f} · ТБ 3.5 {pct(p['cards_over35'])} · "
-        f"ТБ 4.5 {pct(p['cards_over45'])}",
-    ]
-
-    # --- итоговые прогнозы (именно они идут в статистику) ---
+    # ---- итоговые прогнозы в рамке (именно они идут в статистику) ----
     top_key, top_label, top_p = max(
         (("1", "П1", p["home"]), ("X", "Х", p["draw"]), ("2", "П2", p["away"])),
         key=lambda x: x[2])
-    odds_key = {"1": "home", "X": "draw", "2": "away"}[top_key]
-    over = p["over25"] >= 0.5
-    btts = p["btts"] >= 0.5
+    okey = {"1": "home", "X": "draw", "2": "away"}[top_key]
+    over, btts = p["over25"] >= 0.5, p["btts"] >= 0.5
     tot_p = p["over25"] if over else 1 - p["over25"]
     btts_p = p["btts"] if btts else 1 - p["btts"]
-    tot_odd = odd_of(odds, "over" if over else "under")
+    tkey = "over" if over else "under"
+    o1, o2 = odd_of(odds, okey), odd_of(odds, tkey)
     mkt = (odds or {}).get("prob", {})
 
-    lines += [
-        "", "📌 <b>Прогноз</b>",
-        pick_line("Исход", top_label, top_p, odd_of(odds, odds_key), mkt.get(odds_key)),
-        pick_line("Тотал", "ТБ 2.5" if over else "ТМ 2.5", tot_p, tot_odd,
-                  mkt.get("over" if over else "under")),
-        f"▸ Обе забьют: <b>{'Да' if btts else 'Нет'}</b> — {pct(btts_p)}",
-    ]
-    if not p["table_used"]:
-        lines.append("<i>ℹ️ таблицы ещё нет — оценка по форме</i>")
-    note = odds_footnote(odds)
+    def row(label, pick, pr, o):
+        return f"{label:<9}{pick:<7}{pct(pr):>4}{('@' + f'{o[0]:.2f}') if o else '':>6}"
+
+    out += ["", frame("ИТОГОВЫЙ ПРОГНОЗ", [
+        row("Исход", top_label, top_p, o1),
+        row("Тотал", "ТБ 2.5" if over else "ТМ 2.5", tot_p, o2),
+        row("Обе заб.", "Да" if btts else "Нет", btts_p, None),
+    ])]
+    note = notes_block([odds_note("Исход", top_p, o1, mkt.get(okey)),
+                        odds_note("Тотал", tot_p, o2, mkt.get(tkey))], odds)
     if note:
-        lines.append(note)
+        out.append(note)
+    if not p["table_used"]:
+        out.append("<i>ℹ️ таблицы ещё нет — оценка только по форме</i>")
 
     picks = [
-        dict(market="1X2", pick=top_key, label=top_label, prob=top_p,
-             odd=odd_of(odds, odds_key)),
-        dict(market="TOTAL25", pick="over" if over else "under",
-             label="ТБ 2.5" if over else "ТМ 2.5", prob=tot_p, odd=tot_odd),
-        dict(market="BTTS", pick="yes" if btts else "no",
-             label="Да" if btts else "Нет", prob=btts_p, odd=None),
+        dict(market="1X2", pick=top_key, label=top_label, prob=top_p, odd=o1),
+        dict(market="TOTAL25", pick=tkey, label="ТБ 2.5" if over else "ТМ 2.5", prob=tot_p, odd=o2),
+        dict(market="BTTS", pick="yes" if btts else "no", label="Да" if btts else "Нет",
+             prob=btts_p, odd=None),
     ]
-    return "\n".join(lines), picks
+    return "\n".join(out), picks
 
 
 async def football_texts(code: str, days: int = 7, limit: int = 6, only_today: bool = False) -> list:
@@ -795,37 +831,44 @@ def predict_tennis(r1, r2, f1=None, f2=None):
 
 
 def tennis_form_icons(f) -> str:
-    return "".join("🟢" if w else "🔴" for w in f[-5:]) if f else "н/д"
+    f = (f or [])[-5:]
+    return "".join("🟢" if w else "🔴" for w in f) + "⚪" * (5 - len(f))
+
+
+def last_name(full: str, n: int = 10) -> str:
+    s = full.split()[-1] if full else full
+    return s if len(s) <= n else s[: n - 1] + "…"
 
 
 def tennis_card(p1, p2, when, tournament, prob, r1, r2, f1, f2, odds, code):
     fav_is_1 = prob >= 0.5
     fav, fav_p = (p1, prob) if fav_is_1 else (p2, 1 - prob)
-    fav_key = "home" if fav_is_1 else "away"
-    o1, o2 = odd_of(odds, "home"), odd_of(odds, "away")
+    fkey = "home" if fav_is_1 else "away"
+    o1, o2, ofav = odd_of(odds, "home"), odd_of(odds, "away"), odd_of(odds, fkey)
+    l1, l2 = last_name(p1), last_name(p2)
 
-    pre = []
-    for name, pr, o in ((p1, prob, o1), (p2, 1 - prob, o2)):
-        pre.append(f"{short_name(name):<11} {bar(pr, 8)} {pr * 100:>3.0f}%"
-                   + (f"  {o[0]:.2f}" if o else ""))
-    lines = [
-        f"🎾 <b>{esc(p1)} — {esc(p2)}</b>",
-        f"🏟 {esc(tournament)} · 🕒 {local_time(when)}",
-        "",
-        f"Рейтинг: #{r1.get('rank')} │ #{r2.get('rank')}",
-        f"Форма: {tennis_form_icons(f1)} │ {tennis_form_icons(f2)}",
-        "", "<b>Победа</b> · модель" + (" │ лучший кф" if odds else ""),
-        "<pre>" + "\n".join(pre) + "</pre>",
-        "📌 <b>Прогноз</b>",
-        pick_line("Победитель", fav, fav_p, odd_of(odds, fav_key),
-                  (odds or {}).get("prob", {}).get(fav_key)),
-    ]
-    note = odds_footnote(odds)
+    t = [f"{'':<10}{l1:>10}{l2:>10}",
+         f"{'Рейтинг':<10}{'#' + str(r1.get('rank')):>10}{'#' + str(r2.get('rank')):>10}",
+         HR, f"{'ПОБЕДА':<17}{'Мод.':>5}{'Кф':>8}" if odds else f"{'ПОБЕДА':<22}{'Модель':>8}"]
+    for name, pr, o in ((l1, prob, o1), (l2, 1 - prob, o2)):
+        left = f"{name[:8]:<8} {bar(pr, 8)}"
+        t.append(f"{left:<17}{pct(pr):>5}{fo(o):>8}" if odds else f"{left:<22}{pct(pr):>8}")
+
+    out = [f"🎾 <b>{esc(p1)} — {esc(p2)}</b>",
+           f"🏟 {esc(tournament)} · 🕒 {local_time(when)}",
+           "", "<b>Форма</b>",
+           f"{tennis_form_icons(f1)}  {esc(l1)}",
+           f"{tennis_form_icons(f2)}  {esc(l2)}",
+           "", pre(t), "",
+           frame("ИТОГОВЫЙ ПРОГНОЗ", [
+               "Победитель матча",
+               f"{last_name(fav, 14):<14}{pct(fav_p):>4}{('@' + f'{ofav[0]:.2f}') if ofav else '':>8}",
+           ])]
+    note = notes_block([odds_note("Победа", fav_p, ofav, (odds or {}).get("prob", {}).get(fkey))], odds)
     if note:
-        lines.append(note)
-    pick = dict(market="WIN", pick="1" if fav_is_1 else "2", label=fav, prob=fav_p,
-                odd=odd_of(odds, fav_key))
-    return "\n".join(lines), [pick]
+        out.append(note)
+    pick = dict(market="WIN", pick="1" if fav_is_1 else "2", label=fav, prob=fav_p, odd=ofav)
+    return "\n".join(out), [pick]
 
 
 async def tennis_texts(code: str, limit: int = 6) -> list:
@@ -1027,15 +1070,23 @@ async def settle_job(context: ContextTypes.DEFAULT_TYPE):
 # Статистика
 # ======================================================================
 MARKET_NAMES = {"1X2": "Исход 1X2", "TOTAL25": "Тотал 2.5", "BTTS": "Обе забьют",
-                "WIN": "Теннис: победитель"}
+                "WIN": "Теннис: победа"}
 PERIOD_NAMES = {"7": "7 дней", "30": "30 дней", "all": "всё время"}
 SPORT_NAMES = {"all": "всё", "football": "⚽ футбол", "tennis": "🎾 теннис"}
 
 
-def _rate(rows: list) -> str:
+def _rate(rows: list) -> tuple:
     n = len(rows)
     w = sum(1 for r in rows if r["status"] == "win")
-    return f"{w / n * 100:.0f}% ({w}/{n})" if n else "—"
+    return (f"{w / n * 100:.0f}%", f"{w}/{n}") if n else ("—", "0/0")
+
+
+def stat_table(title: str, items: list) -> list:
+    lines = [f"{title:<15}{'Точн.':>5}{'Зашло':>10}"]
+    for name, rows in items:
+        acc, rec = _rate(rows)
+        lines.append(f"{name[:15]:<15}{acc:>5}{rec:>10}")
+    return lines
 
 
 def render_stats(period: str = "all", sport: str = "all") -> str:
@@ -1053,13 +1104,13 @@ def render_stats(period: str = "all", sport: str = "all") -> str:
     pending = db_all(f"SELECT COUNT(*) c FROM predictions WHERE status='pending' {sport_sql}", sport_args)[0]["c"]
     void = db_all(f"SELECT COUNT(*) c FROM predictions WHERE status='void' {sport_sql}", sport_args)[0]["c"]
 
-    out = [f"📈 <b>Статистика прогнозов</b>",
+    out = ["📈 <b>Статистика прогнозов</b>",
            f"<i>{PERIOD_NAMES[period]} · {SPORT_NAMES[sport]}</i>", ""]
     if not rows:
         out.append("Пока нет проверенных прогнозов за этот период.")
         if pending:
             out.append(f"⏳ Ждут результата: {pending}")
-        out.append("\nПрогнозы попадают в статистику после первого показа и окончания матча.")
+        out.append("\n<i>Прогнозы попадают в статистику после первого показа и окончания матча.</i>")
         return "\n".join(out)
 
     n = len(rows)
@@ -1068,54 +1119,52 @@ def render_stats(period: str = "all", sport: str = "all") -> str:
     ci = 1.96 * math.sqrt(acc * (1 - acc) / n)
     avg_p = sum(r["prob"] for r in rows) / n
 
-    out += [
-        f"✅ Зашло: <b>{w}</b>   ❌ Не зашло: <b>{n - w}</b>   (всего {n})",
-        f"Точность: <b>{acc * 100:.0f}%</b> ±{ci * 100:.0f} п.п.",
-        f"<code>{bar(acc, 20)}</code>",
-        f"Средняя уверенность модели: {avg_p * 100:.0f}%",
-    ]
+    out.append(frame("ИТОГО", [
+        f"{'Проверено':<14}{n:>12}",
+        f"{'Зашло':<14}{w:>6}{pct(w / n):>6}",
+        f"{'Не зашло':<14}{n - w:>6}{pct((n - w) / n):>6}",
+        bar(acc, FW),
+        f"{'Точность':<14}{f'{acc * 100:.0f}% ±{ci * 100:.0f} п.п.':>12}",
+        f"{'Уверенность':<14}{pct(avg_p):>12}",
+    ]))
     if n < MIN_SAMPLE_WARN:
-        out.append(f"⚠️ Выборка мала (меньше {MIN_SAMPLE_WARN}) — выводы пока ненадёжны.")
+        out.append(f"⚠️ <i>Выборка мала (меньше {MIN_SAMPLE_WARN}) — выводы пока ненадёжны.</i>")
     elif avg_p - acc > 0.05:
-        out.append("↳ модель переоценивает себя: уверенность выше фактической точности.")
+        out.append("<i>Модель переоценивает себя: уверенность выше фактической точности.</i>")
     elif acc - avg_p > 0.05:
-        out.append("↳ модель осторожна: фактическая точность выше заявленной.")
+        out.append("<i>Модель осторожна: фактическая точность выше заявленной.</i>")
     else:
-        out.append("↳ уверенность модели близка к фактической точности.")
+        out.append("<i>Уверенность модели близка к фактической точности.</i>")
 
-    out += ["", "<b>По рынкам</b>"]
-    for mk, name in MARKET_NAMES.items():
-        sub = [r for r in rows if r["market"] == mk]
-        if sub:
-            out.append(f"• {name}: {_rate(sub)}")
-
+    t = stat_table("РЫНОК", [(name, [r for r in rows if r["market"] == mk])
+                              for mk, name in MARKET_NAMES.items()
+                              if any(r["market"] == mk for r in rows)])
     comps = [c for c in LEAGUES if any(r["comp"] == c for r in rows)]
     if len(comps) > 1:
-        out += ["", "<b>По турнирам</b>"]
-        for c in comps:
-            out.append(f"• {esc(LEAGUES[c])}: {_rate([r for r in rows if r['comp'] == c])}")
-
-    out += ["", "<b>По уверенности модели</b>"]
-    for lo, hi, name in ((0, .5, "до 50%"), (.5, .6, "50–59%"), (.6, .7, "60–69%"), (.7, 1.01, "70%+")):
-        sub = [r for r in rows if lo <= r["prob"] < hi]
-        if sub:
-            out.append(f"• {name}: {_rate(sub)}")
+        t += [HR] + stat_table("ТУРНИР", [(LEAGUE_PLAIN[c], [r for r in rows if r["comp"] == c])
+                                          for c in comps])
+    conf = [(name, [r for r in rows if lo <= r["prob"] < hi])
+            for lo, hi, name in ((0, .5, "до 50%"), (.5, .6, "50–59%"), (.6, .7, "60–69%"),
+                                 (.7, 1.01, "70% и выше"))]
+    t += [HR] + stat_table("УВЕРЕННОСТЬ", [(nm, rs) for nm, rs in conf if rs])
+    out += ["", pre(t)]
 
     with_odds = [r for r in rows if r["odds"]]
     if with_odds:
         profit = sum((r["odds"] - 1) if r["status"] == "win" else -1 for r in with_odds)
-        roi = profit / len(with_odds)
         avg_odd = sum(r["odds"] for r in with_odds) / len(with_odds)
-        out += ["", "💰 <b>С коэффициентами</b>",
-                f"{len(with_odds)} прогнозов с известным кф (средний {avg_odd:.2f}).",
-                f"Условно по 1 ед. на каждый: <b>{profit:+.1f} ед.</b>, ROI <b>{roi:+.1%}</b>",
+        out += ["", "💰 <b>Если ставить по 1 ед. на каждый прогноз с кф</b>",
+                pre([f"{'Прогнозов с кф':<20}{len(with_odds):>10}",
+                     f"{'Средний кф':<20}{avg_odd:>10.2f}",
+                     f"{'Итог, ед.':<20}{profit:>+10.1f}",
+                     f"{'ROI':<20}{profit / len(with_odds):>+10.1%}"]),
                 "<i>кф взяты на момент первого показа прогноза</i>"]
 
     out += ["", "<b>Последние результаты</b>"]
-    for r in rows[:6]:
+    for r in rows[:5]:
         icon = "✅" if r["status"] == "win" else "❌"
-        out.append(f"{icon} {esc(r['home'])} — {esc(r['away'])} · {esc(r['pick_label'])} · "
-                   f"{esc(r['result'])}")
+        out.append(f"{icon} <b>{esc(r['home'])} — {esc(r['away'])}</b>\n"
+                   f"      {esc(r['pick_label'])} · {esc(r['result'])}")
 
     tail = []
     if pending:
@@ -1158,11 +1207,11 @@ def save_subs(subs: dict) -> None:
 
 
 def footer() -> str:
-    s = ("ℹ️ Вероятности — статистическая модель, а не гарантия результата.")
+    s = "ℹ️ <i>Вероятности — статистическая модель, а не гарантия результата.</i>"
     if ODDS_ENABLED:
-        s += ("\n💎 value = модель оценивает исход выше рынка (вероятность × кф − 1). "
-              "Рынок обычно точнее простой модели — относитесь как к подсказке.")
-    s += "\n🔞 18+. Играйте ответственно."
+        s += ("\n💎 <i>value — модель оценивает исход выше рынка (вероятность × кф − 1). "
+              "Рынок обычно точнее простой модели, это лишь подсказка.</i>")
+    s += "\n🔞 <i>18+. Играйте ответственно.</i>"
     return s
 
 
@@ -1192,7 +1241,7 @@ async def send_digest(bot, chat_id: int) -> None:
     await bot.send_message(chat_id, "☀️ <b>Прогнозы на сегодня</b>", parse_mode=ParseMode.HTML)
     for text in messages:
         await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML)
-    await bot.send_message(chat_id, footer(), reply_markup=main_keyboard())
+    await bot.send_message(chat_id, footer(), reply_markup=main_keyboard(), parse_mode=ParseMode.HTML)
 
 
 async def daily_job(context: ContextTypes.DEFAULT_TYPE):
@@ -1385,11 +1434,11 @@ async def league_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("Ближайших матчей с достаточными данными нет.",
                                   reply_markup=main_keyboard())
         return
-    chunks = chunk_messages(f"<b>{esc(LEAGUES[code])}</b> — ближайшие матчи", texts)
+    chunks = chunk_messages(f"<b>{esc(LEAGUES[code])}</b> · ближайшие матчи", texts)
     await q.edit_message_text(chunks[0], parse_mode=ParseMode.HTML)
     for c in chunks[1:]:
         await q.message.reply_text(c, parse_mode=ParseMode.HTML)
-    await q.message.reply_text(footer(), reply_markup=main_keyboard())
+    await q.message.reply_text(footer(), reply_markup=main_keyboard(), parse_mode=ParseMode.HTML)
 
 
 def main():

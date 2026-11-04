@@ -72,6 +72,7 @@ LEAGUES = {
     "SA": "🇮🇹 Серия A",
     "BL1": "🇩🇪 Бундеслига",
     "FL1": "🇫🇷 Лига 1",
+    "RPL": "🇷🇺 РПЛ",
     "ATP": "🎾 Теннис ATP",
     "WTA": "🎾 Теннис WTA",
 }
@@ -86,10 +87,11 @@ ODDS_SPORT = {
     "SA": "soccer_italy_serie_a",
     "BL1": "soccer_germany_bundesliga",
     "FL1": "soccer_france_ligue_one",
+    "RPL": "soccer_russia_premier_league",
 }
 
 # Средний тотал жёлтых карточек в матче (оценочно, у бесплатного API статистики нет)
-LEAGUE_CARD_AVG = {"CL": 4.1, "PL": 3.8, "PD": 5.0, "SA": 4.5, "BL1": 3.9, "FL1": 3.9}
+LEAGUE_CARD_AVG = {"CL": 4.1, "PL": 3.8, "PD": 5.0, "SA": 4.5, "BL1": 3.9, "FL1": 3.9, "RPL": 4.2}
 DEFAULT_CARD_AVG = 4.0
 KNOCKOUT_CARD_BONUS = 0.5
 GLOBAL_AVG_GOALS = 2.6
@@ -97,6 +99,10 @@ GLOBAL_AVG_GOALS = 2.6
 FORM_WEIGHT = 0.35
 SPLIT_WEIGHT = 0.5
 TENNIS_FORM_K = 0.6
+
+# Веса источников при объединении вероятностей
+ODDS_CONSENSUS_WEIGHT = 0.55   # консенсус рынка (самый информированный источник)
+MODEL_WEIGHT = 0.45            # наша модель Пуассона
 
 VALUE_EDGE = 0.05           # пометка 💎, если ожидаемая выгода (p·кф − 1) ≥ 5%
 MAX_MODEL_GAP = 0.20        # модель расходится с рынком больше чем на 20 п.п. — не помечаем value
@@ -228,7 +234,8 @@ async def get_table(code: str) -> dict:
     return table
 
 
-async def get_matches(code: str, days: int) -> list:
+async def get_matches(code: str, days: int = 1) -> list:
+    """Только сегодняшние матчи (days=1) или ближайшие days дней."""
     today = datetime.now(TZ).date()
     data = await api_get(
         f"/competitions/{code}/matches",
@@ -239,6 +246,14 @@ async def get_matches(code: str, days: int) -> list:
         },
     )
     return data["matches"]
+
+
+async def get_today_matches(code: str) -> list:
+    """Строго сегодняшние матчи в локальном часовом поясе бота."""
+    matches = await get_matches(code, days=1)
+    today = datetime.now(TZ).date()
+    return [m for m in matches
+            if parse_iso(m["utcDate"]).astimezone(TZ).date() == today]
 
 
 async def get_form(code: str, n: int = 5) -> dict:
@@ -388,6 +403,28 @@ _ALIAS = {
     "internazionale milano": "inter",
     "inter milan": "inter",
     "bayern munchen": "bayern munich",
+    "zenit st petersburg": "zenit",
+    "fc zenit": "zenit",
+    "spartak moscow": "spartak",
+    "cska moscow": "cska",
+    "dynamo moscow": "dynamo",
+    "lokomotiv moscow": "lokomotiv",
+    "krasnodar": "krasnodar",
+    "rubin kazan": "rubin",
+    "akron togliatti": "akron",
+    "fakel voronezh": "fakel",
+    "rostov": "rostov",
+    "ural yekaterinburg": "ural",
+    "ural sverdlovskaya oblast": "ural",
+    "khimki": "khimki",
+    "nizhny novgorod": "nizhny",
+    "pfc sochi": "sochi",
+    "sochi": "sochi",
+    "samara": "samara",
+    "krylya sovetov samara": "krylya sovetov",
+    "orenburg": "orenburg",
+    "pari nizhny novgorod": "nizhny",
+    "baltika kaliningrad": "baltika",
 }
 
 
@@ -641,6 +678,22 @@ def outcome_table(rows, odds) -> list:
     return lines
 
 
+def merge_probs(model_p: dict, market_p: dict | None) -> dict:
+    """Объединяем вероятности модели и консенсуса рынка (если есть)."""
+    if not market_p:
+        return model_p
+    merged = {}
+    for k in model_p:
+        mp = market_p.get(k)
+        if mp is not None:
+            merged[k] = MODEL_WEIGHT * model_p[k] + ODDS_CONSENSUS_WEIGHT * mp
+        else:
+            merged[k] = model_p[k]
+    # нормализация
+    s = sum(merged.values())
+    return {k: v / s for k, v in merged.items()}
+
+
 def football_card(m: dict, table: dict, form: dict, code: str, odds):
     """-> (текст HTML, список прогнозов для учёта в статистике)."""
     h, a = m["homeTeam"], m["awayTeam"]
@@ -669,6 +722,17 @@ def football_card(m: dict, table: dict, form: dict, code: str, odds):
     if not p:
         out += ["", "ℹ️ Недостаточно данных для прогноза."]
         return "\n".join(out), []
+
+    # ---- объединяем с консенсусом рынка ----
+    market_p = (odds or {}).get("prob", {})
+    p_merged = merge_probs(
+        {"home": p["home"], "draw": p["draw"], "away": p["away"]},
+        {k: v for k, v in market_p.items() if k in ("home", "draw", "away")}
+    )
+    p["home"], p["draw"], p["away"] = p_merged["home"], p_merged["draw"], p_merged["away"]
+    p["dc_1x"] = p["home"] + p["draw"]
+    p["dc_12"] = p["home"] + p["away"]
+    p["dc_x2"] = p["draw"] + p["away"]
 
     # ---- таблица модели (всё выровнено по сетке TW) ----
     t = tbl + [HR] if tbl else []
@@ -725,12 +789,9 @@ def football_card(m: dict, table: dict, form: dict, code: str, odds):
     return "\n".join(out), picks
 
 
-async def football_texts(code: str, days: int = 7, limit: int = 6, only_today: bool = False) -> list:
-    matches = await get_matches(code, days)
-    if only_today:
-        today = datetime.now(TZ).date()
-        matches = [m for m in matches
-                   if parse_iso(m["utcDate"]).astimezone(TZ).date() == today]
+async def football_texts(code: str, limit: int = 10) -> list:
+    """Только сегодняшние матчи выбранного турнира."""
+    matches = await get_today_matches(code)
     if not matches:
         return []
     table = await get_table(code)
@@ -779,17 +840,22 @@ async def get_tennis_rankings(tour: str) -> dict:
 
 
 async def get_tennis_matches(tour: str) -> list:
+    """Только сегодняшние матчи (в локальном поясе бота)."""
     data = await espn_get(f"/{tour}/scoreboard")
+    today = datetime.now(TZ).date()
     result = []
     for ev in data.get("events", []):
         for c in _singles(ev):
             state = ((c.get("status") or {}).get("type") or {}).get("state")
             if state != "pre":
                 continue
+            when = c.get("date") or c.get("startDate") or ""
+            dt = parse_iso(when)
+            if not dt or dt.astimezone(TZ).date() != today:
+                continue
             names = [(x.get("athlete") or {}).get("displayName") for x in c.get("competitors", [])]
             if len(names) == 2 and all(names):
-                result.append((names[0], names[1], c.get("date") or c.get("startDate") or "",
-                               ev.get("name", "")))
+                result.append((names[0], names[1], when, ev.get("name", "")))
     return result
 
 
@@ -841,6 +907,10 @@ def last_name(full: str, n: int = 10) -> str:
 
 
 def tennis_card(p1, p2, when, tournament, prob, r1, r2, f1, f2, odds, code):
+    # объединяем с рынком
+    market_p = (odds or {}).get("prob", {})
+    if market_p and "home" in market_p and "away" in market_p:
+        prob = MODEL_WEIGHT * prob + ODDS_CONSENSUS_WEIGHT * market_p["home"]
     fav_is_1 = prob >= 0.5
     fav, fav_p = (p1, prob) if fav_is_1 else (p2, 1 - prob)
     fkey = "home" if fav_is_1 else "away"
@@ -871,7 +941,8 @@ def tennis_card(p1, p2, when, tournament, prob, r1, r2, f1, f2, odds, code):
     return "\n".join(out), [pick]
 
 
-async def tennis_texts(code: str, limit: int = 6) -> list:
+async def tennis_texts(code: str, limit: int = 10) -> list:
+    """Только сегодняшние матчи тенниса."""
     tour = TENNIS[code]
     ranks = await get_tennis_rankings(tour)
     matches = await get_tennis_matches(tour)
@@ -1089,7 +1160,7 @@ def stat_table(title: str, items: list) -> list:
     return lines
 
 
-def render_stats(period: str = "all", sport: str = "all") -> str:
+def render_stats(period: str = "all", sport: str = "all", comp: str = "all") -> str:
     where, args = ["status IN ('win','loss')"], []
     if period != "all":
         since = (datetime.now(timezone.utc) - timedelta(days=int(period))).isoformat(timespec="seconds")
@@ -1098,14 +1169,21 @@ def render_stats(period: str = "all", sport: str = "all") -> str:
     if sport != "all":
         where.append("sport = ?")
         args.append(sport)
+    if comp != "all":
+        where.append("comp = ?")
+        args.append(comp)
     rows = db_all(f"SELECT * FROM predictions WHERE {' AND '.join(where)} ORDER BY kickoff DESC", args)
 
     sport_sql, sport_args = ("AND sport = ?", [sport]) if sport != "all" else ("", [])
-    pending = db_all(f"SELECT COUNT(*) c FROM predictions WHERE status='pending' {sport_sql}", sport_args)[0]["c"]
-    void = db_all(f"SELECT COUNT(*) c FROM predictions WHERE status='void' {sport_sql}", sport_args)[0]["c"]
+    comp_sql, comp_args = ("AND comp = ?", [comp]) if comp != "all" else ("", [])
+    pending = db_all(f"SELECT COUNT(*) c FROM predictions WHERE status='pending' {sport_sql} {comp_sql}",
+                     sport_args + comp_args)[0]["c"]
+    void = db_all(f"SELECT COUNT(*) c FROM predictions WHERE status='void' {sport_sql} {comp_sql}",
+                  sport_args + comp_args)[0]["c"]
 
+    comp_label = LEAGUE_PLAIN.get(comp, "все турниры") if comp != "all" else "все турниры"
     out = ["📈 <b>Статистика прогнозов</b>",
-           f"<i>{PERIOD_NAMES[period]} · {SPORT_NAMES[sport]}</i>", ""]
+           f"<i>{PERIOD_NAMES[period]} · {SPORT_NAMES[sport]} · {esc(comp_label)}</i>", ""]
     if not rows:
         out.append("Пока нет проверенных прогнозов за этот период.")
         if pending:
@@ -1140,7 +1218,7 @@ def render_stats(period: str = "all", sport: str = "all") -> str:
                               for mk, name in MARKET_NAMES.items()
                               if any(r["market"] == mk for r in rows)])
     comps = [c for c in LEAGUES if any(r["comp"] == c for r in rows)]
-    if len(comps) > 1:
+    if len(comps) > 1 and comp == "all":
         t += [HR] + stat_table("ТУРНИР", [(LEAGUE_PLAIN[c], [r for r in rows if r["comp"] == c])
                                           for c in comps])
     conf = [(name, [r for r in rows if lo <= r["prob"] < hi])
@@ -1178,16 +1256,55 @@ def render_stats(period: str = "all", sport: str = "all") -> str:
     return "\n".join(out)
 
 
-def stats_keyboard(period: str, sport: str) -> InlineKeyboardMarkup:
+def stats_keyboard(period: str, sport: str, comp: str) -> InlineKeyboardMarkup:
     def mark(cur, val, label):
         return ("• " if cur == val else "") + label
-    return InlineKeyboardMarkup([
+    kb = [
         [InlineKeyboardButton(mark(period, p, PERIOD_NAMES[p].capitalize()),
-                              callback_data=f"st:{p}:{sport}") for p in ("7", "30", "all")],
+                              callback_data=f"st:{p}:{sport}:{comp}") for p in ("7", "30", "all")],
         [InlineKeyboardButton(mark(sport, s, SPORT_NAMES[s].capitalize()),
-                              callback_data=f"st:{period}:{s}") for s in ("all", "football", "tennis")],
-        [InlineKeyboardButton("⬅️ Меню", callback_data="menu")],
-    ])
+                              callback_data=f"st:{period}:{s}:{comp}") for s in ("all", "football", "tennis")],
+    ]
+    # выбор турнира
+    comp_btns = []
+    for c, name in LEAGUES.items():
+        comp_btns.append(InlineKeyboardButton(
+            mark(comp, c, name.split(" ", 1)[1]),
+            callback_data=f"st:{period}:{sport}:{c}"))
+    kb.append(comp_btns[:4])
+    kb.append(comp_btns[4:])
+    kb.append([InlineKeyboardButton("⬅️ Меню", callback_data="menu")])
+    return InlineKeyboardMarkup(kb)
+
+
+def render_today_stats(comp: str) -> str:
+    """Сегодняшние прогнозы по выбранному турниру (все рынки)."""
+    today = datetime.now(TZ).date()
+    start = datetime.combine(today, dtime.min, tzinfo=TZ).astimezone(timezone.utc).isoformat(timespec="seconds")
+    end = datetime.combine(today + timedelta(days=1), dtime.min, tzinfo=TZ).astimezone(timezone.utc).isoformat(timespec="seconds")
+    rows = db_all(
+        "SELECT * FROM predictions WHERE comp = ? AND kickoff >= ? AND kickoff < ? "
+        "ORDER BY kickoff", (comp, start, end))
+    if not rows:
+        return (f"📋 <b>Сегодняшние прогнозы: {esc(LEAGUE_PLAIN.get(comp, comp))}</b>\n\n"
+                "Сегодня по этому турниру прогнозов ещё не было.")
+    out = [f"📋 <b>Сегодняшние прогнозы: {esc(LEAGUE_PLAIN.get(comp, comp))}</b>", ""]
+    # группируем по матчу
+    by_match: dict = {}
+    for r in rows:
+        by_match.setdefault((r["home"], r["away"], r["kickoff"]), []).append(r)
+    for (home, away, kickoff), rs in by_match.items():
+        status_icons = {"pending": "⏳", "win": "✅", "loss": "❌", "void": "➖"}
+        st = rs[0]["status"]
+        icon = status_icons.get(st, "⏳")
+        out.append(f"{icon} <b>{esc(home)} — {esc(away)}</b> · {local_time(kickoff)}")
+        for r in rs:
+            odd_str = f" @{r['odds']:.2f}" if r["odds"] else ""
+            res_str = f" — {esc(r['result'])}" if r["result"] else ""
+            out.append(f"   • {esc(MARKET_NAMES.get(r['market'], r['market']))}: "
+                       f"{esc(r['pick_label'])}{odd_str} ({pct(r['prob'])}){res_str}")
+        out.append("")
+    return "\n".join(out)
 
 
 # ======================================================================
@@ -1220,11 +1337,9 @@ async def build_digest() -> list:
     for code, name in LEAGUES.items():
         try:
             if code in TENNIS:
-                texts = await tennis_texts(code, limit=3)
-            elif code == "CL":
-                texts = await football_texts(code, days=1, limit=8, only_today=True)
+                texts = await tennis_texts(code, limit=4)
             else:
-                texts = await football_texts(code, days=1, limit=3, only_today=True)
+                texts = await football_texts(code, limit=4)
         except Exception as e:
             log.warning("Дайджест: ошибка в %s: %s", code, e)
             continue
@@ -1236,7 +1351,7 @@ async def build_digest() -> list:
 async def send_digest(bot, chat_id: int) -> None:
     messages = await build_digest()
     if not messages:
-        await bot.send_message(chat_id, "Сегодня топ-матчей с прогнозами не нашлось.")
+        await bot.send_message(chat_id, "Сегодня матчей с прогнозами не нашлось.")
         return
     await bot.send_message(chat_id, "☀️ <b>Прогнозы на сегодня</b>", parse_mode=ParseMode.HTML)
     for text in messages:
@@ -1289,7 +1404,7 @@ def main_keyboard() -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(n, callback_data=f"lg:{c}") for c, n in items[i:i + 2]]
             for i in range(0, len(items), 2)]
     rows.append([InlineKeyboardButton("☀️ Сегодня", callback_data="dg"),
-                 InlineKeyboardButton("📈 Статистика", callback_data="st:all:all")])
+                 InlineKeyboardButton("📈 Статистика", callback_data="st:all:all:all")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -1299,7 +1414,7 @@ START_TEXT = (
     "🎾 Вероятность победы по рейтингу и форме\n"
     "💰 Коэффициенты БК рядом с прогнозом\n"
     "📈 Честная статистика: сколько прогнозов зашло, а сколько нет\n\n"
-    "Выберите турнир или подпишитесь на рассылку: /subscribe"
+    "Показываю только сегодняшние матчи. Выберите турнир или подпишитесь на рассылку: /subscribe"
 )
 
 
@@ -1331,8 +1446,10 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/unsubscribe — отключить рассылку\n\n"
         f"Время указывается по поясу {esc(TZ.key)}.\n\n"
         "<b>Как это считается</b>\n"
-        "Модель Пуассона + форма (общая и дом/гостевая). Жёлтые карточки — грубая оценка "
-        "(у бесплатного API нет статистики), в учёт не идут.\n\n"
+        "Модель Пуассона + форма (общая и дом/гостевая). Вероятности исхода объединяются "
+        "с консенсусом рынка (коэффициенты десятков букмекеров) — рынок самый информированный "
+        "«каппер». Жёлтые карточки — грубая оценка (у бесплатного API нет статистики), "
+        "в учёт не идут.\n\n"
         "<b>Как считается статистика</b>\n"
         "Прогноз фиксируется при первом показе, до матча, и потом не меняется. После матча "
         "бот сам сверяет результат (рынки — по основному времени). Мало прогнозов — мало "
@@ -1389,26 +1506,43 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await settle_all()
     except Exception as e:
         log.warning("settle перед статистикой: %s", e)
-    await update.message.reply_text(render_stats("all", "all"), parse_mode=ParseMode.HTML,
-                                    reply_markup=stats_keyboard("all", "all"))
+    await update.message.reply_text(render_stats("all", "all", "all"), parse_mode=ParseMode.HTML,
+                                    reply_markup=stats_keyboard("all", "all", "all"))
 
 
 async def stats_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    _, period, sport = q.data.split(":")
-    if period not in PERIOD_NAMES or sport not in SPORT_NAMES:
+    parts = q.data.split(":")
+    if len(parts) < 4:
+        return
+    _, period, sport, comp = parts
+    if period not in PERIOD_NAMES or sport not in SPORT_NAMES or comp not in LEAGUES and comp != "all":
         return
     try:
         await settle_all()
     except Exception as e:
         log.warning("settle перед статистикой: %s", e)
     try:
-        await q.edit_message_text(render_stats(period, sport), parse_mode=ParseMode.HTML,
-                                  reply_markup=stats_keyboard(period, sport))
+        await q.edit_message_text(render_stats(period, sport, comp), parse_mode=ParseMode.HTML,
+                                  reply_markup=stats_keyboard(period, sport, comp))
     except BadRequest as e:
         if "not modified" not in str(e).lower():
             raise
+
+
+async def today_stats_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать сегодняшние прогнозы по турниру."""
+    q = update.callback_query
+    await q.answer()
+    code = q.data.split(":", 1)[1]
+    if code not in LEAGUES:
+        return
+    await q.edit_message_text(render_today_stats(code), parse_mode=ParseMode.HTML,
+                              reply_markup=InlineKeyboardMarkup([[
+                                  InlineKeyboardButton("📈 Полная статистика",
+                                                       callback_data="st:all:all:all"),
+                                  InlineKeyboardButton("⬅️ Меню", callback_data="menu")]]))
 
 
 async def league_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1417,28 +1551,33 @@ async def league_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE):
     code = q.data.split(":", 1)[1]
     if code not in LEAGUES:
         return
-    await q.edit_message_text(f"⏳ Загружаю матчи: {LEAGUES[code]}… (до 30 секунд)")
+    await q.edit_message_text(f"⏳ Загружаю сегодняшние матчи: {LEAGUES[code]}… (до 30 секунд)")
     try:
         if code in TENNIS:
-            texts = await tennis_texts(code, 6)
-        elif code == "CL":
-            texts = await football_texts(code, days=14, limit=16)
+            texts = await tennis_texts(code, 10)
         else:
-            texts = await football_texts(code, 7, 6)
+            texts = await football_texts(code, 10)
     except Exception as e:
         log.warning("Ошибка загрузки %s: %s", code, e)
         await q.edit_message_text(f"😕 Не получилось получить данные: {e}",
                                   reply_markup=main_keyboard())
         return
     if not texts:
-        await q.edit_message_text("Ближайших матчей с достаточными данными нет.",
-                                  reply_markup=main_keyboard())
+        await q.edit_message_text(
+            f"Сегодня по турниру «{LEAGUES[code]}» матчей с прогнозами нет.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("📋 Сегодняшние прогнозы", callback_data=f"ts:{code}"),
+                InlineKeyboardButton("⬅️ Меню", callback_data="menu")]]))
         return
-    chunks = chunk_messages(f"<b>{esc(LEAGUES[code])}</b> · ближайшие матчи", texts)
+    chunks = chunk_messages(f"<b>{esc(LEAGUES[code])}</b> · сегодня", texts)
     await q.edit_message_text(chunks[0], parse_mode=ParseMode.HTML)
     for c in chunks[1:]:
         await q.message.reply_text(c, parse_mode=ParseMode.HTML)
-    await q.message.reply_text(footer(), reply_markup=main_keyboard(), parse_mode=ParseMode.HTML)
+    await q.message.reply_text(
+        footer(), parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("📋 Сегодняшние прогнозы", callback_data=f"ts:{code}"),
+            InlineKeyboardButton("⬅️ Меню", callback_data="menu")]]))
 
 
 def main():
@@ -1452,6 +1591,7 @@ def main():
     app.add_handler(CallbackQueryHandler(league_chosen, pattern=r"^lg:"))
     app.add_handler(CallbackQueryHandler(digest_cb, pattern=r"^dg$"))
     app.add_handler(CallbackQueryHandler(stats_cb, pattern=r"^st:"))
+    app.add_handler(CallbackQueryHandler(today_stats_cb, pattern=r"^ts:"))
     app.add_handler(CallbackQueryHandler(menu_cb, pattern=r"^menu$"))
     app.run_polling()
 
